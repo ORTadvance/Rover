@@ -1,0 +1,496 @@
+"""
+B4 - Base Station Communications Module
+UKSEDS ORT Base Station Software
+=====================================
+Handles:
+  - Transmitting drive commands to the rover (UDP, 20 Hz)
+  - Receiving telemetry from the rover (UDP JSON packets)
+  - Receiving JPEG video frames from the rover (UDP)
+  - Link health monitoring with configurable loss timeout
+  - Automatic reconnection attempts on link loss
+  - Ethernet fallback detection (FR-12 / RR-02)
+  - Heartbeat watchdog: sends periodic pings so rover can detect base loss
+
+Port map (must match rover M5):
+  CMD_PORT      5000   base → rover   Drive commands (JSON)
+  TELEMETRY_PORT 5001  rover → base   Telemetry (JSON)
+  VIDEO_PORT    5002   rover → base   JPEG frames (4-byte length + JPEG)
+  HEARTBEAT_PORT 5003  base → rover   Heartbeat pings (JSON)
+
+Integration:
+  - Writes into AppState (same object used by B1 and B2)
+  - B1 reads  state.telemetry, state.latest_frame
+  - B1 writes state.command  (B4 reads and transmits it)
+  - B3 is notified via b3.log_action() on link events
+
+Dependencies:
+    pip install (stdlib only)
+
+Usage:
+    comms = CommsManager(rover_ip="192.168.1.100")
+    comms.start(state, b3_logger)
+    ...
+    comms.stop()
+"""
+
+import socket
+import threading
+import time
+import json
+import struct
+import subprocess
+import platform
+from typing import Optional
+
+
+# ─────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────
+
+CMD_PORT            = 5000
+TELEMETRY_PORT      = 5001
+VIDEO_PORT          = 5002
+HEARTBEAT_PORT      = 5003
+
+CMD_RATE_HZ         = 20          # Drive command transmit rate
+HEARTBEAT_RATE_HZ   = 2           # Heartbeat ping rate
+LINK_TIMEOUT_S      = 3.0         # Seconds without telemetry → link lost
+RECONNECT_INTERVAL  = 5.0         # Seconds between reconnect attempts
+MAX_UDP_SIZE        = 65507       # Max UDP datagram size
+
+# Ethernet fallback interface name (platform-dependent)
+ETH_INTERFACE_LINUX = "eth0"
+ETH_INTERFACE_WIN   = "Ethernet"
+
+
+# ─────────────────────────────────────────────
+# Link State
+# ─────────────────────────────────────────────
+
+class LinkState:
+    """Tracks communication link health."""
+
+    def __init__(self):
+        self._lock          = threading.Lock()
+        self.connected      = False
+        self.last_rx        = 0.0       # Timestamp of last telemetry packet
+        self.packets_rx     = 0         # Total telemetry packets received
+        self.packets_tx     = 0         # Total command packets sent
+        self.link_losses    = 0         # Number of link loss events
+        self.using_ethernet = False     # True when on Ethernet fallback
+
+    def record_rx(self):
+        with self._lock:
+            self.last_rx    = time.time()
+            self.packets_rx += 1
+            self.connected  = True
+
+    def record_tx(self):
+        with self._lock:
+            self.packets_tx += 1
+
+    def check_timeout(self, timeout_s: float) -> bool:
+        """Returns True if link has just gone from connected → lost."""
+        with self._lock:
+            if self.connected and self.last_rx > 0:
+                if time.time() - self.last_rx > timeout_s:
+                    self.connected   = False
+                    self.link_losses += 1
+                    return True
+        return False
+
+    @property
+    def summary(self) -> dict:
+        with self._lock:
+            return {
+                "connected":      self.connected,
+                "packets_rx":     self.packets_rx,
+                "packets_tx":     self.packets_tx,
+                "link_losses":    self.link_losses,
+                "using_ethernet": self.using_ethernet,
+                "last_rx_ago_s":  round(time.time() - self.last_rx, 1)
+                                  if self.last_rx else None,
+            }
+
+
+# ─────────────────────────────────────────────
+# Ethernet Fallback Detection
+# ─────────────────────────────────────────────
+
+def ethernet_available() -> bool:
+    """
+    Check whether a wired Ethernet interface is up.
+    Used to detect when the operator has plugged in the fallback cable.
+    """
+    system = platform.system()
+    try:
+        if system == "Linux":
+            result = subprocess.run(
+                ["ip", "link", "show", ETH_INTERFACE_LINUX],
+                capture_output=True, text=True, timeout=2
+            )
+            return "state UP" in result.stdout
+
+        elif system == "Windows":
+            result = subprocess.run(
+                ["netsh", "interface", "show", "interface", ETH_INTERFACE_WIN],
+                capture_output=True, text=True, timeout=2
+            )
+            return "Connected" in result.stdout
+
+        elif system == "Darwin":  # macOS (testing)
+            result = subprocess.run(
+                ["ifconfig", "en0"],
+                capture_output=True, text=True, timeout=2
+            )
+            return "status: active" in result.stdout
+
+    except Exception:
+        pass
+    return False
+
+
+# ─────────────────────────────────────────────
+# Comms Manager
+# ─────────────────────────────────────────────
+
+class CommsManager:
+    """
+    Manages all UDP communications between base station and rover.
+    Runs four background threads:
+      1. command_tx    — sends drive commands at CMD_RATE_HZ
+      2. heartbeat_tx  — sends heartbeat pings at HEARTBEAT_RATE_HZ
+      3. telemetry_rx  — receives and parses telemetry JSON
+      4. video_rx      — receives and decodes JPEG frames
+    Plus a link monitor that watches for dropouts and reconnection.
+    """
+
+    def __init__(self, rover_ip: str = "192.168.1.100"):
+        self.rover_ip   = rover_ip
+        self.link       = LinkState()
+        self._running   = False
+        self._threads   = []
+        self._state     = None
+        self._b3        = None
+
+    def start(self, state, b3_logger=None):
+        """
+        state      : AppState from b1_operator_interface
+        b3_logger  : MissionLogger instance (optional, for link event logging)
+        """
+        self._state   = state
+        self._b3      = b3_logger
+        self._running = True
+
+        targets = [
+            self._command_tx,
+            self._heartbeat_tx,
+            self._telemetry_rx,
+            self._video_rx,
+            self._link_monitor,
+        ]
+        for fn in targets:
+            t = threading.Thread(target=fn, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+        print(f"[B4] Communications started → rover @ {self.rover_ip}")
+
+    def stop(self):
+        self._running = False
+        for t in self._threads:
+            t.join(timeout=2.0)
+        print("[B4] Communications stopped.")
+
+    # ─────────────────────────────────────────
+    # Thread 1: Command TX
+    # ─────────────────────────────────────────
+
+    def _command_tx(self):
+        sock     = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        interval = 1.0 / CMD_RATE_HZ
+
+        while self._running:
+            t0 = time.time()
+
+            with self._state.cmd_lock:
+                cmd = self._state.command
+                payload = json.dumps({
+                    "throttle": round(float(cmd.throttle), 3),
+                    "steering": round(float(cmd.steering), 3),
+                    "stop":     bool(cmd.stop),
+                    "capture":  bool(cmd.capture),
+                    "ts":       round(time.time(), 3),
+                }).encode()
+                # Consume single-shot capture flag after reading
+                self._state.command.capture = False
+
+            try:
+                sock.sendto(payload, (self.rover_ip, CMD_PORT))
+                self.link.record_tx()
+            except OSError as e:
+                print(f"[B4] CMD TX error: {e}")
+
+            elapsed = time.time() - t0
+            time.sleep(max(0.0, interval - elapsed))
+
+        sock.close()
+
+    # ─────────────────────────────────────────
+    # Thread 2: Heartbeat TX
+    # ─────────────────────────────────────────
+
+    def _heartbeat_tx(self):
+        """
+        Sends periodic heartbeat so rover watchdog (RR-03) knows
+        the base station is alive. Rover should stop motors if
+        heartbeats stop arriving.
+        """
+        sock     = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        interval = 1.0 / HEARTBEAT_RATE_HZ
+        seq      = 0
+
+        while self._running:
+            payload = json.dumps({
+                "type": "heartbeat",
+                "seq":  seq,
+                "ts":   round(time.time(), 3),
+            }).encode()
+            try:
+                sock.sendto(payload, (self.rover_ip, HEARTBEAT_PORT))
+            except OSError:
+                pass
+            seq += 1
+            time.sleep(interval)
+
+        sock.close()
+
+    # ─────────────────────────────────────────
+    # Thread 3: Telemetry RX
+    # ─────────────────────────────────────────
+
+    def _telemetry_rx(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("", TELEMETRY_PORT))
+        sock.settimeout(1.0)
+
+        while self._running:
+            try:
+                data, addr = sock.recvfrom(4096)
+                payload    = json.loads(data.decode())
+                self._apply_telemetry(payload)
+                self.link.record_rx()
+            except socket.timeout:
+                pass
+            except json.JSONDecodeError as e:
+                print(f"[B4] Telemetry JSON error: {e}")
+            except OSError as e:
+                print(f"[B4] Telemetry RX error: {e}")
+
+        sock.close()
+
+    def _apply_telemetry(self, payload: dict):
+        """Write received telemetry values into shared AppState."""
+        t = self._state.telemetry
+        t.battery_v = payload.get("battery_v", t.battery_v)
+        t.uptime_s  = payload.get("uptime_s",  t.uptime_s)
+        t.temp_c    = payload.get("temp_c",    t.temp_c)
+        t.link_ok   = True
+        t.last_rx   = time.time()
+
+    # ─────────────────────────────────────────
+    # Thread 4: Video RX
+    # ─────────────────────────────────────────
+
+    def _video_rx(self):
+        """
+        Receives JPEG frames from rover.
+        Protocol: 4-byte big-endian length header + JPEG bytes.
+        Falls back gracefully if frames are too large or malformed.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("", VIDEO_PORT))
+        sock.settimeout(1.0)
+
+        try:
+            import numpy as np
+            import cv2
+            has_cv2 = True
+        except ImportError:
+            has_cv2 = False
+            print("[B4] WARNING: opencv/numpy not available — video disabled.")
+
+        while self._running:
+            try:
+                data, _ = sock.recvfrom(MAX_UDP_SIZE)
+                if len(data) < 4:
+                    continue
+
+                length = struct.unpack(">I", data[:4])[0]
+                jpeg   = data[4:4 + length]
+
+                if has_cv2:
+                    arr   = np.frombuffer(jpeg, dtype=np.uint8)
+                    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        with self._state.frame_lock:
+                            self._state.latest_frame = frame
+
+            except socket.timeout:
+                pass
+            except struct.error:
+                pass
+            except OSError as e:
+                print(f"[B4] Video RX error: {e}")
+
+        sock.close()
+
+    # ─────────────────────────────────────────
+    # Thread 5: Link Monitor
+    # ─────────────────────────────────────────
+
+    def _link_monitor(self):
+        """
+        Monitors link health. On loss:
+          - Updates state.telemetry.link_ok
+          - Logs to B3
+          - Checks for Ethernet fallback availability
+          - Alerts operator via state.alerts
+        On recovery:
+          - Logs reconnection event
+          - Clears alert
+        """
+        was_connected = False
+
+        while self._running:
+            time.sleep(0.5)
+
+            # ── Check for link loss ────────────────────────────────────
+            just_lost = self.link.check_timeout(LINK_TIMEOUT_S)
+
+            if just_lost:
+                self._state.telemetry.link_ok = False
+                msg = "LINK LOST — no telemetry from rover"
+                print(f"[B4] ⚠  {msg}")
+                self._state.alerts.append(msg)
+
+                if self._b3:
+                    self._b3.log_action("LINK_LOST", f"timeout={LINK_TIMEOUT_S}s")
+
+                # Check Ethernet fallback
+                if ethernet_available():
+                    eth_msg = "Ethernet fallback available — plug in cable"
+                    print(f"[B4] ℹ  {eth_msg}")
+                    self._state.alerts.append(eth_msg)
+                    self.link.using_ethernet = True
+                    if self._b3:
+                        self._b3.log_action("ETH_FALLBACK_DETECTED", "")
+
+                was_connected = False
+
+            # ── Check for reconnection ─────────────────────────────────
+            if self.link.connected and not was_connected:
+                self._state.telemetry.link_ok = True
+                reconnect_msg = "Link restored"
+                print(f"[B4] ✓  {reconnect_msg}")
+
+                # Remove link-loss alerts
+                self._state.alerts = [
+                    a for a in self._state.alerts
+                    if "LINK LOST" not in a and "Ethernet fallback" not in a
+                ]
+                self._state.alerts.append(reconnect_msg)
+
+                if self._b3:
+                    self._b3.log_action("LINK_RESTORED",
+                                        f"losses={self.link.link_losses}")
+                was_connected = True
+
+            elif self.link.connected:
+                was_connected = True
+
+    # ─────────────────────────────────────────
+    # Utility
+    # ─────────────────────────────────────────
+
+    @property
+    def status(self) -> dict:
+        return self.link.summary
+
+
+# ─────────────────────────────────────────────
+# Standalone test (no rover needed)
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    """
+    Loopback test: starts CommsManager and sends fake telemetry
+    back to itself to verify TX/RX plumbing.
+    Press Ctrl+C to stop.
+    """
+    import sys
+
+    print("[B4] Standalone loopback test")
+    print("     Sending fake telemetry to localhost:5001")
+    print("     Ctrl+C to stop\n")
+
+    # Minimal AppState stub
+    class _Lock:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    class _Telemetry:
+        battery_v = 0.0
+        uptime_s  = 0.0
+        temp_c    = 0.0
+        link_ok   = False
+        last_rx   = 0.0
+
+    class _Command:
+        throttle = 0.0
+        steering = 0.0
+        stop     = False
+        capture  = False
+
+    class _State:
+        telemetry  = _Telemetry()
+        command    = _Command()
+        latest_frame = None
+        alerts     = []
+        frame_lock = _Lock()
+        cmd_lock   = _Lock()
+
+    state = _State()
+
+    # Fake rover: sends telemetry packets to ourselves
+    def fake_rover():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        v, uptime = 8.1, 0
+        while True:
+            payload = json.dumps({
+                "battery_v": round(v, 2),
+                "uptime_s":  uptime,
+                "temp_c":    45.0,
+            }).encode()
+            sock.sendto(payload, ("127.0.0.1", TELEMETRY_PORT))
+            v      -= 0.01
+            uptime += 1
+            time.sleep(1.0)
+
+    threading.Thread(target=fake_rover, daemon=True).start()
+
+    comms = CommsManager(rover_ip="127.0.0.1")
+    comms.start(state)
+
+    try:
+        while True:
+            t = state.telemetry
+            print(f"[B4] Link={t.link_ok}  Batt={t.battery_v:.2f}V  "
+                  f"Temp={t.temp_c:.1f}°C  Uptime={t.uptime_s:.0f}s  "
+                  f"TX={comms.link.packets_tx}  RX={comms.link.packets_rx}")
+            time.sleep(2.0)
+    except KeyboardInterrupt:
+        comms.stop()
+        print("\n[B4] Test complete.")
+        print(f"     Final link status: {comms.status}")
