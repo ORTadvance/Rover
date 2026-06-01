@@ -1,0 +1,13 @@
+[Unit]
+Description=ORT Rover
+After=network.target
+
+[Service]
+ExecStartPre=/bin/bash -c 'sudo pigpiod; sleep 1'
+ExecStart=/home/pi/ort-rover/rover/venv/bin/python /home/pi/ort-rover/rover/rover.py
+WorkingDirectory=/home/pi/ort-rover/rover
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

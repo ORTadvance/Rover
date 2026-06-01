@@ -1,0 +1,12 @@
+missions/
+rover/mission_logs/
+CODE_REVIEW.md
+ORT_IMPLEMENTATION_PLAN.md
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+*.log
+*.tmp
+.DS_Store
