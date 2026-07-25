@@ -53,7 +53,7 @@ JPEG_QUALITY         = 80     # 0–100, lower = smaller packet, higher = sharpe
 QR_BLUR_THRESHOLD    = 100.0  # Laplacian variance — frames below this are too blurry for QR
 
 # ── Obstacle safety ────────────────────────────────────
-OBSTACLE_BLOCK_DRIVE = True   # False = show warning only, True = block drive command
+OBSTACLE_BLOCK_DRIVE = False   # False = show warning only, True = block drive command
                               # operator can override this at runtime via the base station UI
 
 # ── Mock mode ──────────────────────────────────────────
