@@ -45,6 +45,9 @@ from config import (
     OBSTACLE_BLOCK_DRIVE,
     PWM_FREQUENCY,
     QR_BLUR_THRESHOLD,
+    RAMP_ENABLED,
+    RAMP_HZ,
+    RAMP_RATE,
     RIGHT_FRONT_DIR,
     RIGHT_FRONT_PWM,
     RIGHT_REAR_DIR,
@@ -163,6 +166,8 @@ class MotorController:
         self._gpio  = gpio
         self._left  = 0.0
         self._right = 0.0
+        self._target_left  = 0.0
+        self._target_right = 0.0
         self._log   = logging.getLogger("motors")
 
         for pin in (LEFT_FRONT_PWM, LEFT_REAR_PWM, RIGHT_FRONT_PWM, RIGHT_REAR_PWM):
@@ -175,8 +180,34 @@ class MotorController:
         self._log.info("ready")
 
     def set_speeds(self, left: float, right: float) -> None:
+        """Set the DESIRED speeds. With ramping enabled these are approached
+        gradually by step(); otherwise they are applied immediately."""
         left  = max(-MAX_SPEED, min(MAX_SPEED, left))
         right = max(-MAX_SPEED, min(MAX_SPEED, right))
+        self._target_left  = left
+        self._target_right = right
+        if not RAMP_ENABLED:
+            self._apply(left, right)
+
+    def step(self, dt: float) -> None:
+        """Advance current speeds toward the targets by at most RAMP_RATE * dt.
+        Called periodically by the rover's motor-ramp loop."""
+        if not RAMP_ENABLED:
+            return
+        max_delta = RAMP_RATE * dt
+        self._left  = self._approach(self._left,  self._target_left,  max_delta)
+        self._right = self._approach(self._right, self._target_right, max_delta)
+        self._apply(self._left, self._right)
+
+    @staticmethod
+    def _approach(current: float, target: float, max_delta: float) -> float:
+        if current < target:
+            return min(current + max_delta, target)
+        if current > target:
+            return max(current - max_delta, target)
+        return current
+
+    def _apply(self, left: float, right: float) -> None:
         self._left  = left
         self._right = right
         self._drive_side(left,  LEFT_FRONT_PWM,  LEFT_FRONT_DIR,  LEFT_REAR_PWM,  LEFT_REAR_DIR)
@@ -195,6 +226,9 @@ class MotorController:
         self._gpio.set_pwm_duty(pwm_r, duty)
 
     def stop(self) -> None:
+        # immediate hard stop — never ramped (used by E-stop and safe state)
+        self._target_left  = 0.0
+        self._target_right = 0.0
         for pin in (LEFT_FRONT_PWM, LEFT_REAR_PWM, RIGHT_FRONT_PWM, RIGHT_REAR_PWM):
             self._gpio.set_pwm_duty(pin, 0)
         self._left  = 0.0
@@ -661,6 +695,12 @@ class Rover:
             self.comms.send_heartbeat()
             await asyncio.sleep(interval)
 
+    async def _motor_ramp_loop(self) -> None:
+        dt = 1.0 / RAMP_HZ
+        while self._running:
+            self.motors.step(dt)
+            await asyncio.sleep(dt)
+
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -675,6 +715,7 @@ class Rover:
                 self._video_loop(),
                 self._watchdog_loop(),
                 self._heartbeat_loop(),
+                self._motor_ramp_loop(),
             )
         except asyncio.CancelledError:
             pass
