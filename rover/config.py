@@ -24,6 +24,13 @@ RIGHT_REAR_DIR  = 25
 PWM_FREQUENCY   = 1000   # Hz
 MAX_SPEED       = 1.0    # normalised cap [0.0, 1.0]
 
+# ── Motor soft-start / ramp ────────────────────────────
+RAMP_ENABLED    = True   # True = ease motor speed toward target (soft-start)
+                         # False = apply commanded speed instantly (old behaviour)
+RAMP_RATE       = 2.5    # max change in normalised speed per second
+                         # 2.5 → stop-to-full in ~0.4 s; lower = gentler, softer on the battery
+RAMP_HZ         = 50     # how often the ramp loop updates the motors
+
 # ── Camera servo (MG92B) ───────────────────────────────
 SERVO_PIN       = 17
 SERVO_MIN_PW    = 500    # microseconds — full down
@@ -53,8 +60,8 @@ JPEG_QUALITY         = 80     # 0–100, lower = smaller packet, higher = sharpe
 QR_BLUR_THRESHOLD    = 100.0  # Laplacian variance — frames below this are too blurry for QR
 
 # ── Obstacle safety ────────────────────────────────────
-OBSTACLE_BLOCK_DRIVE = False   # False = show warning only, True = block drive command
-                              # operator can override this at runtime via the base station UI
+OBSTACLE_BLOCK_DRIVE = False  # IR obstacle blocking disabled (sensors removed)
+                              # set True to re-enable drive blocking from the IR sensors
 
 # ── Mock mode ──────────────────────────────────────────
 MOCK_MODE = True   # True = no GPIO, no camera, runs on any PC
