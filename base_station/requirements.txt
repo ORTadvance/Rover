@@ -1,0 +1,7 @@
+pyzmq>=25.0
+pygame>=2.5
+opencv-python>=4.8
+pyzbar>=0.1.9
+numpy>=1.24
+qrcode>=7.4
+pillow>=10.0
