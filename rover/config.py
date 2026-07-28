@@ -64,5 +64,5 @@ OBSTACLE_BLOCK_DRIVE = False  # IR obstacle blocking disabled (sensors removed)
                               # set True to re-enable drive blocking from the IR sensors
 
 # ── Mock mode ──────────────────────────────────────────
-MOCK_MODE = True   # True = no GPIO, no camera, runs on any PC
+MOCK_MODE = False   # True = no GPIO, no camera, runs on any PC
                    # SET TO FALSE before deploying to the real Pi
